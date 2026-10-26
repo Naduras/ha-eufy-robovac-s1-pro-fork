@@ -588,25 +588,13 @@ class RobovacVacuum(CoordinatorEntity, StateVacuumEntity):
             self._was_paused = False
             return VacuumActivity.RETURNING
         
-        # Fallback to DPS 6/7 combination
-        if dps6 == 2 and dps7 == 3:
-            self._was_paused = False
-            return VacuumActivity.CLEANING
-        elif dps6 == 3 and dps7 == 4:
-            self._was_paused = True
-            return VacuumActivity.PAUSED
-        elif dps6 == 1 and dps7 == 2:
-            self._was_paused = False
-            return VacuumActivity.RETURNING
-        elif dps6 == 0 and dps7 == 0:
-            battery = self.coordinator.data.get("8", 0)
-            if battery >= 95:
-                return VacuumActivity.DOCKED
-            else:
-                return VacuumActivity.IDLE
-        
-        # デフォルト
-        return VacuumActivity.IDLE
+        # Without DPS 153 (e.g. right after a restart, the robot only publishes it
+        # on the next state change) DPS 6/7 are not a reliable status source:
+        # observed values while docked include 3/4, 3/2, 0/0 and 26/17. Report
+        # DOCKED, which is where the robot spends nearly all of its idle time;
+        # the next DPS 153 update corrects it immediately.
+        self._was_paused = False
+        return VacuumActivity.DOCKED
 
     @property
     def battery_level(self) -> int | None:
