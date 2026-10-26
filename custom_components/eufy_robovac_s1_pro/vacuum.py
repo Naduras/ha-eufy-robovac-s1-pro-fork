@@ -9,8 +9,16 @@ from homeassistant.components.vacuum import (
     VacuumEntityFeature,
     VacuumActivity,
 )
+
+try:  # Home Assistant 2026.3+: native area cleaning (vacuum.clean_area)
+    from homeassistant.components.vacuum import Segment
+except ImportError:  # older Home Assistant
+    Segment = None
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.event import async_call_later
+from homeassistant.util import dt as dt_util
+import datetime
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -18,6 +26,212 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import CONF_COORDINATOR, CONF_DISCOVERED_DEVICES, DOMAIN
 
 logger = logging.getLogger(__name__)
+
+# --- Room cleaning (eufy "Novel" protocol, DPS 152 ModeCtrlRequest) ---------
+# Room IDs are the IDs the eufy app assigns to the rooms on the saved map.
+# They are not reported locally, so they are offered as generic segments
+# "Raum 1" ... "Raum N" which are mapped to HA areas in the entity settings.
+ROOM_SEGMENT_COUNT = 12
+# Known eufy room IDs on the saved map (from the app's schedules); others show as "Raum N".
+ROOM_NAMES = {0: "Bad", 1: "Kinderzimmer", 2: "Flur", 3: "Wohnzimmer", 4: "Küche"}
+MODE_CTRL_START_SELECT_ROOMS_CLEAN = 1
+
+
+def _pb_varint(value: int) -> bytes:
+    out = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        if value:
+            out.append(byte | 0x80)
+        else:
+            out.append(byte)
+            return bytes(out)
+
+
+def _pb_uint(field: int, value: int) -> bytes:
+    return _pb_varint(field << 3) + _pb_varint(value)
+
+
+def _pb_bytes(field: int, value: bytes) -> bytes:
+    return _pb_varint((field << 3) | 2) + _pb_varint(len(value)) + value
+
+
+def _pb_frame(message: bytes) -> str:
+    return base64.b64encode(_pb_varint(len(message)) + message).decode()
+
+
+# The S1 Pro (T2080A) ignores the room list of a GENERAL room clean and only
+# accepts its *local* map id (1 for the first saved map, not the cloud id).
+# Working sequence (as the eufy app does it):
+#   1. DPS 170 MapEditRequest SET_ROOMS_CUSTOM with map_id + rooms
+#   2. DPS 152 ModeCtrlRequest START_SELECT_ROOMS_CLEAN, mode CUSTOMIZE
+MAP_EDIT_SET_ROOMS_CUSTOM = 5
+SELECT_ROOMS_MODE_CUSTOMIZE = 1
+DEFAULT_LOCAL_MAP_ID = 1
+
+
+def build_room_custom_command(room_ids: list[int], map_id: int, clean_times: int = 1) -> str:
+    """DPS 170 payload: MapEditRequest(SET_ROOMS_CUSTOM) for the given rooms."""
+    rooms = b"".join(
+        _pb_bytes(1, _pb_uint(1, room_id) + _pb_bytes(2, _pb_uint(5, clean_times)))
+        for room_id in room_ids
+    )
+    rooms_custom = _pb_bytes(3, rooms)  # RoomsCustom.rooms_parm
+    request = (
+        _pb_uint(1, MAP_EDIT_SET_ROOMS_CUSTOM)
+        + _pb_uint(3, map_id)
+        + _pb_bytes(10, rooms_custom)
+    )
+    return _pb_frame(request)
+
+
+def build_room_clean_command(
+    room_ids: list[int],
+    clean_times: int = 1,
+    map_id: int | None = DEFAULT_LOCAL_MAP_ID,
+    customize: bool = True,
+) -> str:
+    """DPS 152 payload: START_SELECT_ROOMS_CLEAN for the given rooms in order."""
+    rooms = b"".join(
+        _pb_bytes(1, _pb_uint(1, room_id) + _pb_uint(2, order))
+        for order, room_id in enumerate(room_ids, start=1)
+    )
+    select_rooms = rooms + _pb_uint(2, clean_times)
+    if map_id is not None:
+        select_rooms += _pb_uint(3, map_id)
+    if customize:
+        select_rooms += _pb_uint(5, SELECT_ROOMS_MODE_CUSTOMIZE)
+    request = _pb_uint(1, MODE_CTRL_START_SELECT_ROOMS_CLEAN) + _pb_bytes(4, select_rooms)
+    return _pb_frame(request)
+
+
+# --- Room cleaning via one-shot timer (DPS 164) -------------------------------
+# On FW 7.0.x the S1 Pro ignores the room list of an immediate room clean and
+# cleans the room last selected in the app. Room cleaning from a *schedule* is
+# executed correctly, so a single-shot timer for the next minute is created and
+# deleted again once it has fired. See tkoba1974/ha-eufy-robovac-s1-pro#24.
+TIMER_DPS = "164"
+TIMER_ADD = 1
+TIMER_DELETE = 2
+TIMER_INQUIRY = 6
+ACTION_SCHEDULE_ROOMS_CLEAN = 1
+
+FAN_TO_LEVEL = {"Quiet": 0, "gentle": 0, "Standard": 1, "normal": 1, "middle": 1,
+                "Turbo": 2, "strong": 2, "Max": 3, "max": 3, "Maximum": 3}
+WATER_TO_LEVEL = {"low": 0, "middle": 1, "high": 2}
+CLEAN_TYPE = {"vacuum": 0, "mop": 1, "vacuum_mop": 2}
+
+
+def build_timer_rooms_clean(
+    room_ids: list[int],
+    hour: int,
+    minute: int,
+    seq: int,
+    map_id: int = DEFAULT_LOCAL_MAP_ID,
+    fan: int = 0,
+    water: int = 0,
+    clean_type: int = 2,
+    clean_times: int = 1,
+) -> str:
+    """DPS 164 payload: TimerRequest(ADD) for a single room clean at hour:minute."""
+    general = _pb_uint(1, map_id)
+    general += _pb_bytes(2, _pb_uint(1, fan) if fan else b"")
+    general += _pb_bytes(3, _pb_uint(1, water) if water else b"")
+    general += _pb_bytes(4, _pb_uint(1, clean_type) if clean_type else b"")
+    general += _pb_bytes(5, b"")
+    for order, room_id in enumerate(room_ids):
+        room = (_pb_uint(1, room_id) if room_id else b"") + (_pb_uint(2, order) if order else b"")
+        general += _pb_bytes(6, room)
+    if clean_times:
+        general += _pb_uint(17, clean_times)
+    action = _pb_uint(1, ACTION_SCHEDULE_ROOMS_CLEAN) + _pb_bytes(4, _pb_bytes(2, general))
+    timing = _pb_uint(2, 1) + (_pb_uint(3, hour) if hour else b"") + (_pb_uint(4, minute) if minute else b"")
+    desc = _pb_bytes(2, timing)  # trigger SINGLE (0), no cycle
+    status = _pb_uint(1, 1) + _pb_uint(2, 1)  # valid, opened
+    info = _pb_bytes(2, status) + _pb_bytes(3, desc) + _pb_bytes(5, action)
+    request = _pb_uint(1, TIMER_ADD) + _pb_uint(2, seq) + _pb_bytes(3, info)
+    return _pb_frame(request)
+
+
+def build_timer_delete(timer_id: int, seq: int) -> str:
+    """DPS 164 payload: TimerRequest(DELETE) for the given timer id."""
+    request = _pb_uint(1, TIMER_DELETE) + _pb_uint(2, seq) + _pb_bytes(3, _pb_bytes(1, _pb_uint(1, timer_id)))
+    return _pb_frame(request)
+
+
+def _pb_parse(data: bytes) -> list[tuple[int, int, Any]]:
+    """Minimal protobuf parser: list of (field, wire_type, value)."""
+    out: list[tuple[int, int, Any]] = []
+    pos = 0
+
+    def varint() -> int:
+        nonlocal pos
+        result = shift = 0
+        while True:
+            byte = data[pos]
+            pos += 1
+            result |= (byte & 0x7F) << shift
+            shift += 7
+            if byte < 0x80:
+                return result
+
+    while pos < len(data):
+        key = varint()
+        field, wire = key >> 3, key & 7
+        if wire == 0:
+            out.append((field, wire, varint()))
+        elif wire == 2:
+            length = varint()
+            out.append((field, wire, data[pos:pos + length]))
+            pos += length
+        elif wire == 5:
+            pos += 4
+        elif wire == 1:
+            pos += 8
+        else:
+            raise ValueError("unsupported wire type")
+    return out
+
+
+def _pb_get(fields: list[tuple[int, int, Any]], number: int, default: Any = None) -> Any:
+    for field, _, value in fields:
+        if field == number:
+            return value
+    return default
+
+
+def parse_timer_response(value: str) -> tuple[int, int, list[dict[str, Any]]] | None:
+    """Parse a DPS 164 TimerResponse into (method, seq, timers)."""
+    try:
+        raw = base64.b64decode(value)
+        pos = 0
+        length = shift = 0
+        while True:
+            byte = raw[pos]
+            pos += 1
+            length |= (byte & 0x7F) << shift
+            shift += 7
+            if byte < 0x80:
+                break
+        fields = _pb_parse(raw[pos:pos + length])
+        timers = []
+        for field, _, info_raw in fields:
+            if field != 4:
+                continue
+            info = _pb_parse(info_raw)
+            timer_id = _pb_get(_pb_parse(_pb_get(info, 1, b"")), 1, 0)
+            desc = _pb_parse(_pb_get(info, 3, b""))
+            timing = _pb_parse(_pb_get(desc, 2, b""))
+            timers.append({
+                "id": timer_id,
+                "single": _pb_get(desc, 3) is None and not _pb_get(desc, 1, 0),
+                "hour": _pb_get(timing, 3, 0),
+                "minute": _pb_get(timing, 4, 0),
+            })
+        return _pb_get(fields, 1, 0), _pb_get(fields, 2, 0), timers
+    except Exception:  # noqa: BLE001 - malformed or unexpected payload
+        return None
 
 
 # S1 Pro actual fan speed mappings (from app testing)
@@ -58,6 +272,43 @@ class RobovacState(Enum):
     DOCKED = "docked"
     ERROR = "error"
     UNKNOWN = "unknown"
+
+
+def _decode_work_status(decoded: bytes) -> tuple[RobovacState, str] | None:
+    """Decode a length-prefixed WorkStatus message (DPS 153)."""
+    try:
+        length, pos, shift = 0, 0, 0
+        while True:
+            byte = decoded[pos]
+            pos += 1
+            length |= (byte & 0x7F) << shift
+            shift += 7
+            if byte < 0x80:
+                break
+        fields = _pb_parse(decoded[pos:pos + length])
+    except Exception:  # noqa: BLE001
+        return None
+    state = _pb_get(fields, 2, 0)
+    if state == 5:  # CLEANING
+        cleaning = _pb_parse(_pb_get(fields, 6, b"") or b"")
+        go_wash = _pb_get(fields, 7)
+        if go_wash is not None:
+            return RobovacState.CLEANING, "washing_mop"
+        if _pb_get(cleaning, 1, 0) == 1:
+            return RobovacState.PAUSED, "paused"
+        return RobovacState.CLEANING, "cleaning"
+    if state == 7:  # GO_HOME
+        go_home = _pb_parse(_pb_get(fields, 8, b"") or b"")
+        if _pb_get(go_home, 1, 0) == 1:
+            return RobovacState.PAUSED, "paused"
+        return RobovacState.RETURNING, "returning"
+    if state == 2:  # FAULT
+        return RobovacState.ERROR, "error"
+    if state in (4, 6, 8):  # mapping, remote control, cruising
+        return RobovacState.CLEANING, "cleaning"
+    if state in (0, 1, 3, 9):  # standby, sleep, charging, station work
+        return None  # let the existing docked sub-status logic decide
+    return None
 
 
 def decode_dps153_to_state(dps153_value: str) -> tuple[RobovacState, str]:
@@ -130,8 +381,14 @@ def decode_dps153_to_state(dps153_value: str) -> tuple[RobovacState, str]:
             substatus = _get_docked_substatus(decoded)
             return RobovacState.DOCKED, substatus
         
+        # Fallback: decode the WorkStatus protobuf properly (e.g. room cleaning,
+        # where the mode field is set and the byte patterns above do not match).
+        parsed = _decode_work_status(decoded)
+        if parsed is not None:
+            return parsed
+
         # デフォルトはDocked (未知のパターンでも安全側に倒す)
-        logger.warning(f"Unknown dps153 pattern, defaulting to DOCKED: {hex_str}")
+        logger.debug(f"Unknown dps153 pattern, defaulting to DOCKED: {hex_str}")
         return RobovacState.DOCKED, "idle"
         
     except Exception as e:
@@ -227,13 +484,17 @@ class RobovacVacuum(CoordinatorEntity, StateVacuumEntity):
 
     _attr_name = "Eufy Robovac S1 Pro"
     _attr_supported_features = (
-        VacuumEntityFeature.BATTERY
-        | VacuumEntityFeature.PAUSE
+        VacuumEntityFeature.PAUSE
         | VacuumEntityFeature.RETURN_HOME
         | VacuumEntityFeature.START
         | VacuumEntityFeature.STATE
         | VacuumEntityFeature.FAN_SPEED
+        | VacuumEntityFeature.SEND_COMMAND
     )
+    if hasattr(VacuumEntityFeature, "BATTERY"):  # removed in newer Home Assistant
+        _attr_supported_features |= VacuumEntityFeature.BATTERY
+    if Segment is not None:
+        _attr_supported_features |= VacuumEntityFeature.CLEAN_AREA
 
     def __init__(self, coordinator):
         super().__init__(coordinator)
@@ -601,3 +862,129 @@ class RobovacVacuum(CoordinatorEntity, StateVacuumEntity):
             logger.info(f"Fan speed set to {fan_speed}")
         except Exception as e:
             logger.error(f"Failed to set fan speed: {e}")
+
+    def _current_clean_settings(self) -> tuple[int, int, int]:
+        """Mirror the robot's current fan speed, water level and mop state."""
+        dps = self.coordinator.data or {}
+        fan = FAN_TO_LEVEL.get(dps.get("158"), FAN_TO_LEVEL.get(dps.get("9"), 0))
+        water = WATER_TO_LEVEL.get(dps.get("10"), 0)
+        clean_type = CLEAN_TYPE["vacuum"]
+        try:  # DPS 154 field 1.1 is set while mopping is enabled (cleaning mode select)
+            raw = base64.b64decode(dps.get("154") or "")
+            params = _pb_parse(raw[1:1 + raw[0]]) if raw else []
+            mop = _pb_parse(_pb_get(_pb_parse(_pb_get(params, 1, b"")), 1, b""))
+            if mop:
+                clean_type = CLEAN_TYPE["vacuum_mop"]
+        except Exception:  # noqa: BLE001
+            if dps.get("40") == "installed":
+                clean_type = CLEAN_TYPE["vacuum_mop"]
+        return fan, water, clean_type
+
+    async def async_clean_rooms(
+        self,
+        room_ids: list[int],
+        clean_times: int = 1,
+        map_id: int | None = None,
+        clean_mode: str | None = None,
+    ) -> None:
+        """Clean the given eufy room IDs via a one-shot schedule for the next minute."""
+        if not room_ids:
+            logger.warning("Room clean requested without rooms - ignoring")
+            return
+        map_id = DEFAULT_LOCAL_MAP_ID if map_id is None else map_id
+        fan, water, clean_type = self._current_clean_settings()
+        if clean_mode in CLEAN_TYPE:
+            clean_type = CLEAN_TYPE[clean_mode]
+
+        now = dt_util.now()
+        start = (now + datetime.timedelta(minutes=2 if now.second >= 45 else 1)).replace(second=0, microsecond=0)
+        self._timer_seq = (getattr(self, "_timer_seq", 400) + 1) % 60000 or 1
+        seq = self._timer_seq
+        payload = build_timer_rooms_clean(
+            room_ids, start.hour, start.minute, seq, map_id, fan, water, clean_type, clean_times
+        )
+        self._pending_timers = getattr(self, "_pending_timers", {})
+        self._pending_timers[seq] = (start.hour, start.minute, start)
+        logger.info(
+            "Room clean for %s scheduled at %s (map_id=%s, fan=%s, water=%s, type=%s) via DPS 164: %s",
+            room_ids, start.strftime("%H:%M"), map_id, fan, water, clean_type, payload,
+        )
+        self._was_paused = False
+        await self.coordinator.tuya_client.async_set({TIMER_DPS: payload})
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Track our one-shot timers and delete them after they have fired."""
+        pending = getattr(self, "_pending_timers", None)
+        value = (self.coordinator.data or {}).get(TIMER_DPS)
+        if pending and value and value != getattr(self, "_last_timer_value", None):
+            self._last_timer_value = value
+            parsed = parse_timer_response(value)
+            if parsed and parsed[0] == TIMER_ADD and parsed[1] in pending:
+                hour, minute, start = pending.pop(parsed[1])
+                matches = [t for t in parsed[2] if t["single"] and t["hour"] == hour and t["minute"] == minute]
+                if matches:
+                    timer_id = max(t["id"] for t in matches)
+                    delay = max((start - dt_util.now()).total_seconds(), 0) + 120
+                    logger.info("One-shot timer %s created, deleting it in %ds", timer_id, delay)
+                    async def _delete_later(_now, tid=timer_id) -> None:
+                        await self._async_delete_timer(tid)
+
+                    async_call_later(self.hass, delay, _delete_later)
+        super()._handle_coordinator_update()
+
+    async def _async_delete_timer(self, timer_id: int) -> None:
+        self._timer_seq = (getattr(self, "_timer_seq", 400) + 1) % 60000 or 1
+        payload = build_timer_delete(timer_id, self._timer_seq)
+        logger.info("Deleting one-shot timer %s via DPS 164: %s", timer_id, payload)
+        try:
+            await self.coordinator.tuya_client.async_set({TIMER_DPS: payload})
+        except Exception as err:  # noqa: BLE001
+            logger.warning("Could not delete one-shot timer %s: %s", timer_id, err)
+
+    async def async_get_segments(self):
+        """Return the rooms the vacuum can clean (HA area cleaning)."""
+        return [
+            Segment(id=str(room_id), name=ROOM_NAMES.get(room_id, f"Raum {room_id}"))
+            for room_id in sorted(ROOM_NAMES)
+        ]
+
+    async def async_clean_segments(self, segment_ids: list[str], **kwargs: Any) -> None:
+        """Clean the rooms mapped to the requested HA areas."""
+        await self.async_clean_rooms([int(segment_id) for segment_id in segment_ids])
+
+    async def async_send_command(
+        self, command: str, params: dict[str, Any] | list[Any] | None = None, **kwargs: Any
+    ) -> None:
+        """Support vacuum.send_command.
+
+        room_clean: params {"rooms": [4, 2], "clean_times": 1, "clean_mode": "vacuum_mop"}
+                    (clean_mode: vacuum | mop | vacuum_mop; default mirrors the robot)
+                    or simply a list of room IDs [1, 3].
+        """
+        if command == "room_clean":
+            if isinstance(params, list):
+                await self.async_clean_rooms([int(r) for r in params])
+                return
+            params = params or {}
+            rooms = params.get("rooms", [])
+            if isinstance(rooms, (int, str)):
+                rooms = [rooms]
+            map_id = params.get("map_id")
+            await self.async_clean_rooms(
+                [int(r) for r in rooms],
+                int(params.get("clean_times", 1)),
+                int(map_id) if map_id is not None else None,
+                params.get("clean_mode"),
+            )
+            return
+        if command == "raw_dps" and isinstance(params, dict):
+            logger.info("Sending raw DPS %s: %s", params.get("dps"), params.get("value"))
+            await self.coordinator.tuya_client.async_set({str(params["dps"]): params["value"]})
+            return
+        if command == "raw_dps152":
+            value = params.get("value") if isinstance(params, dict) else params
+            logger.info("Sending raw DPS 152 value: %s", value)
+            await self.coordinator.tuya_client.async_set({"152": value})
+            return
+        logger.warning("Unknown command for Eufy S1 Pro: %s", command)
