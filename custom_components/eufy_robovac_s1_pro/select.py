@@ -2,6 +2,7 @@
 import logging
 from typing import Any
 import asyncio
+import base64
 
 from homeassistant.components.select import SelectEntity
 from homeassistant.config_entries import ConfigEntry
@@ -46,6 +47,74 @@ DPS_TO_MODE_MAP = {
     ("FgoMCgIIAhIAGgAiAggBEgYIARABIAE=", "middle"): "mop_middle",
     ("FgoMCgIIAhIAGgAiAggCEgYIARABIAE=", "high"): "mop_high",
 }
+
+
+def _pb_fields(data: bytes) -> dict[int, list]:
+    """Minimal protobuf parser: field number -> list of values."""
+    out: dict[int, list] = {}
+    pos = 0
+
+    def varint() -> int:
+        nonlocal pos
+        result = shift = 0
+        while True:
+            byte = data[pos]
+            pos += 1
+            result |= (byte & 0x7F) << shift
+            shift += 7
+            if byte < 0x80:
+                return result
+
+    while pos < len(data):
+        key = varint()
+        field, wire = key >> 3, key & 7
+        if wire == 0:
+            value = varint()
+        elif wire == 2:
+            length = varint()
+            value = data[pos:pos + length]
+            pos += length
+        elif wire == 5:
+            pos += 4
+            continue
+        elif wire == 1:
+            pos += 8
+            continue
+        else:
+            raise ValueError("unsupported wire type")
+        out.setdefault(field, []).append(value)
+    return out
+
+
+WATER_FROM_DPS154 = {0: "low", 1: "middle", 2: "high"}
+
+
+def decode_cleaning_mode(dps154: str | None, dps10: Any) -> str | None:
+    """Return the CLEANING_MODES key for the robot's current settings.
+
+    DPS 154 also changes with fan speed and other options, so it is decoded
+    structurally instead of being compared to fixed strings: field 1.1 (mop
+    mode) is present while mopping is on, field 1.4.1 is the water level.
+    """
+    if not dps154:
+        return None
+    try:
+        raw = base64.b64decode(dps154)
+        params = _pb_fields(raw[1:1 + raw[0]])
+        clean_param = _pb_fields(params.get(1, [b""])[0])
+    except Exception:  # noqa: BLE001 - malformed payload
+        return None
+    mop = clean_param.get(1, [b""])[0]
+    if not mop:
+        return "vacuum"
+    water = dps10 if dps10 in ("low", "middle", "high") else None
+    if water is None:
+        try:
+            level = _pb_fields(clean_param.get(4, [b""])[0]).get(1, [0])[0]
+        except Exception:  # noqa: BLE001
+            level = 0
+        water = WATER_FROM_DPS154.get(level, "middle")
+    return {"low": "mop_low", "middle": "mop_middle", "high": "mop_high"}[water]
 
 
 async def async_setup_entry(
@@ -109,31 +178,14 @@ class CleaningModeSelect(CoordinatorEntity, RestoreEntity, SelectEntity):
 
     @property
     def current_option(self) -> str | None:
-        """Return the currently selected option."""
-        if not self.coordinator.data:
-            return self._restored_option
-        
-        dps154 = self.coordinator.data.get("154", "")
-        dps10 = self.coordinator.data.get("10", None)
-        
-        # Check if DPS 10 is a string (water level)
-        if isinstance(dps10, str) and dps10 in ["low", "middle", "high"]:
-            water_level = dps10
-        else:
-            water_level = None
-        
-        # Try to find matching mode
-        mode_key = (dps154, water_level)
-        if mode_key in DPS_TO_MODE_MAP:
-            mode = DPS_TO_MODE_MAP[mode_key]
-            if mode in CLEANING_MODES:
-                return CLEANING_MODES[mode]["name"]
-        
-        # Try without water level (vacuum mode)
-        if dps154 == CLEANING_MODES["vacuum"]["dps154"]:
-            return CLEANING_MODES["vacuum"]["name"]
-        
-        return None
+        """Return the currently selected option, keeping the last known one."""
+        data = self.coordinator.data or {}
+        mode = decode_cleaning_mode(data.get("154"), data.get("10"))
+        if mode in CLEANING_MODES:
+            self._restored_option = CLEANING_MODES[mode]["name"]
+        # Keep showing the last known mode when the robot has not (yet)
+        # reported its settings, e.g. right after a restart.
+        return self._restored_option
 
     async def async_select_option(self, option: str) -> None:
         """Change the selected option."""
