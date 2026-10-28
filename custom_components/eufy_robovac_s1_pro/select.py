@@ -213,6 +213,11 @@ class CleaningModeSelect(CoordinatorEntity, RestoreEntity, SelectEntity):
                 await self.coordinator.tuya_client.async_set({"10": mode_config["dps10"]})
             await asyncio.sleep(0.5)
             
+            # The robot does not always echo DPS 154 back, so remember the
+            # chosen mode right away (optimistic) and keep it as last known.
+            self._restored_option = mode_config["name"]
+            self.async_write_ha_state()
+
             # Refresh state
             await self.coordinator.async_request_refresh()
             
