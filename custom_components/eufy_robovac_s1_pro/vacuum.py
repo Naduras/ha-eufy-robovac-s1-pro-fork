@@ -90,25 +90,45 @@ def build_room_clean_command(
     room_ids: list[int],
     clean_times: int = 1,
     map_id: int | None = DEFAULT_LOCAL_MAP_ID,
-    customize: bool = True,
+    customize: bool = False,
 ) -> str:
-    """DPS 152 payload: START_SELECT_ROOMS_CLEAN for the given rooms in order."""
+    """DPS 152 payload: START_SELECT_ROOMS_CLEAN for the given rooms in order.
+
+    The S1 Pro (T2080A) numbers the room order from 0. With orders starting
+    at 1 it ignores the list and cleans room 0 / the last app selection
+    (cf. jeppesens/eufy-clean#182). proto3 zero values are left out.
+    """
+    def uint(field: int, value: int) -> bytes:
+        return _pb_uint(field, value) if value else b""
+
     rooms = b"".join(
-        _pb_bytes(1, _pb_uint(1, room_id) + _pb_uint(2, order))
-        for order, room_id in enumerate(room_ids, start=1)
+        _pb_bytes(1, uint(1, room_id) + uint(2, order))
+        for order, room_id in enumerate(room_ids)
     )
-    select_rooms = rooms + _pb_uint(2, clean_times)
+    select_rooms = rooms + uint(2, clean_times)
     if map_id is not None:
-        select_rooms += _pb_uint(3, map_id)
+        select_rooms += uint(3, map_id)
     if customize:
-        select_rooms += _pb_uint(5, SELECT_ROOMS_MODE_CUSTOMIZE)
+        select_rooms += uint(5, SELECT_ROOMS_MODE_CUSTOMIZE)
     request = _pb_uint(1, MODE_CTRL_START_SELECT_ROOMS_CLEAN) + _pb_bytes(4, select_rooms)
     return _pb_frame(request)
 
 
+def parse_mode_ctrl_result(value: str | None) -> tuple[int, int] | None:
+    """Parse a DPS 152 ModeCtrlResponse into (method, result); result 1 = FAILED."""
+    if not value:
+        return None
+    try:
+        raw = base64.b64decode(value)
+        fields = _pb_parse(raw[1:1 + raw[0]])
+        return _pb_get(fields, 1, 0), _pb_get(fields, 3, 0)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 # --- Room cleaning via one-shot timer (DPS 164) -------------------------------
-# On FW 7.0.x the S1 Pro ignores the room list of an immediate room clean and
-# cleans the room last selected in the app. Room cleaning from a *schedule* is
+# Fallback only: used when the immediate room clean is rejected or a different
+# cleaning mode is requested. Room cleaning from a *schedule* is
 # executed correctly, so a single-shot timer for the next minute is created and
 # deleted again once it has fired. See tkoba1974/ha-eufy-robovac-s1-pro#24.
 TIMER_DPS = "164"
@@ -875,15 +895,57 @@ class RobovacVacuum(CoordinatorEntity, StateVacuumEntity):
         map_id: int | None = None,
         clean_mode: str | None = None,
     ) -> None:
-        """Clean the given eufy room IDs via a one-shot schedule for the next minute."""
+        """Clean the given eufy room IDs.
+
+        Starts immediately (DPS 152, zero-based room order). Falls back to a
+        one-shot schedule for the next minute when the robot rejects the
+        immediate command, or when a cleaning mode other than the robot's
+        current one is requested (schedules carry their own mode).
+        """
         if not room_ids:
             logger.warning("Room clean requested without rooms - ignoring")
             return
         map_id = DEFAULT_LOCAL_MAP_ID if map_id is None else map_id
         fan, water, clean_type = self._current_clean_settings()
-        if clean_mode in CLEAN_TYPE:
-            clean_type = CLEAN_TYPE[clean_mode]
+        wanted_type = CLEAN_TYPE.get(clean_mode, clean_type) if clean_mode else clean_type
+        self._was_paused = False
 
+        if wanted_type == clean_type and await self._async_clean_rooms_now(room_ids, clean_times, map_id):
+            return
+        await self._async_clean_rooms_scheduled(
+            room_ids, clean_times, map_id, fan, water, wanted_type
+        )
+
+    async def _async_clean_rooms_now(
+        self, room_ids: list[int], clean_times: int, map_id: int
+    ) -> bool:
+        """Start a room clean immediately; return False if the robot rejected it."""
+        payload = build_room_clean_command(room_ids, clean_times, map_id)
+        logger.info("Room clean for %s now (map_id=%s) via DPS 152: %s", room_ids, map_id, payload)
+        if self.coordinator.data is not None:
+            self.coordinator.data.pop("152", None)
+        await self.coordinator.tuya_client.async_set({"152": payload})
+        for _ in range(10):
+            await asyncio.sleep(0.5)
+            reply = parse_mode_ctrl_result((self.coordinator.data or {}).get("152"))
+            if reply and reply[0] == MODE_CTRL_START_SELECT_ROOMS_CLEAN:
+                if reply[1] == 1:
+                    logger.warning("Robot rejected immediate room clean, using a schedule instead")
+                    return False
+                break
+        await self.coordinator.async_request_refresh()
+        return True
+
+    async def _async_clean_rooms_scheduled(
+        self,
+        room_ids: list[int],
+        clean_times: int,
+        map_id: int,
+        fan: int,
+        water: int,
+        clean_type: int,
+    ) -> None:
+        """Clean the given rooms via a one-shot schedule for the next minute."""
         now = dt_util.now()
         start = (now + datetime.timedelta(minutes=2 if now.second >= 45 else 1)).replace(second=0, microsecond=0)
         self._timer_seq = (getattr(self, "_timer_seq", 400) + 1) % 60000 or 1
@@ -897,7 +959,6 @@ class RobovacVacuum(CoordinatorEntity, StateVacuumEntity):
             "Room clean for %s scheduled at %s (map_id=%s, fan=%s, water=%s, type=%s) via DPS 164: %s",
             room_ids, start.strftime("%H:%M"), map_id, fan, water, clean_type, payload,
         )
-        self._was_paused = False
         await self.coordinator.tuya_client.async_set({TIMER_DPS: payload})
 
     @callback
