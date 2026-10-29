@@ -141,6 +141,13 @@ FAN_TO_LEVEL = {"Quiet": 0, "gentle": 0, "Standard": 1, "normal": 1, "middle": 1
                 "Turbo": 2, "strong": 2, "Max": 3, "max": 3, "Maximum": 3}
 WATER_TO_LEVEL = {"low": 0, "middle": 1, "high": 2}
 CLEAN_TYPE = {"vacuum": 0, "mop": 1, "vacuum_mop": 2}
+# DPS 154 payloads of the app's cleaning modes (same as select.py), keyed by water level
+CLEAN_MODE_DPS154 = {
+    "vacuum": "FAoKCgASABoAIgIIAhIGCAEQASAB",
+    "low": "FAoKCgIIAhIAGgAiABIGCAEQASAB",
+    "middle": "FgoMCgIIAhIAGgAiAggBEgYIARABIAE=",
+    "high": "FgoMCgIIAhIAGgAiAggCEgYIARABIAE=",
+}
 
 
 def build_timer_rooms_clean(
@@ -897,10 +904,11 @@ class RobovacVacuum(CoordinatorEntity, StateVacuumEntity):
     ) -> None:
         """Clean the given eufy room IDs.
 
-        Starts immediately (DPS 152, zero-based room order). Falls back to a
-        one-shot schedule for the next minute when the robot rejects the
-        immediate command, or when a cleaning mode other than the robot's
-        current one is requested (schedules carry their own mode).
+        Starts immediately (DPS 152, zero-based room order). When another
+        cleaning mode is requested, the robot's mode is switched first
+        (DPS 154/10). Falls back to a one-shot schedule for the next minute
+        when the robot rejects the immediate command or the mode cannot be
+        switched (schedules carry their own mode).
         """
         if not room_ids:
             logger.warning("Room clean requested without rooms - ignoring")
@@ -910,11 +918,39 @@ class RobovacVacuum(CoordinatorEntity, StateVacuumEntity):
         wanted_type = CLEAN_TYPE.get(clean_mode, clean_type) if clean_mode else clean_type
         self._was_paused = False
 
+        if wanted_type != clean_type and await self._async_set_clean_type(wanted_type):
+            clean_type = wanted_type
         if wanted_type == clean_type and await self._async_clean_rooms_now(room_ids, clean_times, map_id):
             return
         await self._async_clean_rooms_scheduled(
             room_ids, clean_times, map_id, fan, water, wanted_type
         )
+
+    async def _async_set_clean_type(self, clean_type: int) -> bool:
+        """Switch the robot's cleaning mode (DPS 154/10) so a room clean can start at once."""
+        dps = self.coordinator.data or {}
+        if clean_type == CLEAN_TYPE["vacuum"]:
+            dps154, dps10 = CLEAN_MODE_DPS154["vacuum"], None
+        elif clean_type == CLEAN_TYPE["vacuum_mop"]:
+            dps10 = dps.get("10") if dps.get("10") in CLEAN_MODE_DPS154 else "middle"
+            dps154 = CLEAN_MODE_DPS154[dps10]
+        else:
+            return False
+        logger.info("Switching cleaning mode to type %s before room clean (DPS 154: %s)", clean_type, dps154)
+        try:
+            await self.coordinator.tuya_client.async_set({"154": dps154})
+            if dps10:
+                await asyncio.sleep(0.5)
+                await self.coordinator.tuya_client.async_set({"10": dps10})
+            await asyncio.sleep(1)
+        except Exception as err:  # noqa: BLE001
+            logger.warning("Could not switch cleaning mode: %s", err)
+            return False
+        if self.coordinator.data is not None:
+            self.coordinator.data["154"] = dps154
+            if dps10:
+                self.coordinator.data["10"] = dps10
+        return True
 
     async def _async_clean_rooms_now(
         self, room_ids: list[int], clean_times: int, map_id: int
